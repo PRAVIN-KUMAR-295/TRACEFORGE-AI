@@ -150,3 +150,105 @@ async def test_human_approval_remediation_workflow():
     updated_inv = investigation_engine.get_investigation(inv_id)
     assert updated_inv.recommended_actions[0].status == "EXECUTED"
     assert updated_inv.status == "MITIGATED"
+
+
+@pytest.mark.asyncio
+async def test_cypher_query_tool_structured_result_and_sanitization():
+    from backend.app.services.investigation_tools import cypher_query_tool, safe_sanitize_params
+
+    # 1. Parameter sanitization check
+    sensitive_params = {
+        "incident_id": "INC-2026-1042",
+        "auth_token": "secret-token-12345",
+        "api_key": "sk-real-live-api-key-999",
+        "nested": {"password": "mypassword123", "normal": "value"}
+    }
+    sanitized = safe_sanitize_params(sensitive_params)
+    assert sanitized["incident_id"] == "INC-2026-1042"
+    assert sanitized["auth_token"] == "[REDACTED]"
+    assert sanitized["api_key"] == "[REDACTED]"
+    assert sanitized["nested"]["password"] == "[REDACTED]"
+    assert sanitized["nested"]["normal"] == "value"
+
+    # 2. Tool execution returns structured result
+    res = cypher_query_tool.execute(
+        query="MATCH (s:Service) WHERE s.id = $service_id RETURN s",
+        params={"service_id": "auth-service"},
+        purpose="Find auth service node"
+    )
+    assert res.success is True
+    assert res.error is None
+    assert res.row_count >= 1
+    assert res.execution_time_ms >= 0
+    assert len(res.rows) >= 1
+    s_data = _safe_get_dict(res.rows[0][0])
+    assert s_data.get("name") == "Authentication Service"
+
+
+@pytest.mark.asyncio
+async def test_dependency_cascade_tool_graph_traversal():
+    from backend.app.services.investigation_tools import dependency_cascade_tool
+
+    res = dependency_cascade_tool.explore(incident_id="INC-2026-1042", step_number=2)
+    assert len(res.affected_services) >= 1
+    assert any(s.get("id") == "checkout-service" for s in res.affected_services)
+
+    # Verify downstream dependencies found
+    dep_targets = {d.get("id") for d in res.dependencies if "id" in d}
+    assert "auth-service" in dep_targets or "payment-service" in dep_targets or "order-service" in dep_targets
+
+    # Verify confirmed facts and Cypher logs produced
+    assert len(res.confirmed_facts) >= 2
+    assert len(res.query_logs) >= 3
+    assert res.tool_record.tool_name == "DependencyCascadeTool"
+
+
+@pytest.mark.asyncio
+async def test_memory_retrieval_tool_grounded_records():
+    from backend.app.services.investigation_tools import memory_retrieval_tool
+
+    # Precedent match for INC-2026-1042 auth service
+    res = memory_retrieval_tool.retrieve(incident_id="INC-2026-1042", step_number=3)
+    assert len(res.matches) >= 1
+    assert res.matches[0].incident_id == "INC-2026-0814"
+    assert "Redis" in res.matches[0].root_cause_summary
+    assert len(res.query_logs) >= 1
+    assert res.tool_record.tool_name == "MemoryRetrievalTool"
+
+    # Empty match for totally unrelated non-existent incident
+    empty_res = memory_retrieval_tool.retrieve(incident_id="INC-NONEXISTENT", step_number=3)
+    assert len(empty_res.matches) == 0
+    assert empty_res.tool_record.status == "EMPTY"
+
+
+@pytest.mark.asyncio
+async def test_investigation_trace_recorded_in_order_with_backward_compatibility():
+    result = await investigation_engine.investigate_incident("INC-2026-1042")
+
+    # 1. Trace presence and sequence
+    assert hasattr(result, "tool_execution_trace")
+    assert len(result.tool_execution_trace) == 3
+
+    tool_names = [t.tool_name for t in result.tool_execution_trace]
+    assert tool_names == [
+        "CypherQueryTool",
+        "DependencyCascadeTool",
+        "MemoryRetrievalTool"
+    ]
+
+    for trace_item in result.tool_execution_trace:
+        assert trace_item.status in ("SUCCESS", "EMPTY")
+        assert trace_item.execution_time_ms >= 0
+        assert len(trace_item.operation) > 0
+        assert len(trace_item.summary) > 0
+
+    # 2. Backward compatibility with existing fields
+    assert result.incident_id == "INC-2026-1042"
+    assert result.status == "IDENTIFIED"
+    assert len(result.confirmed_facts) >= 3
+    assert len(result.root_cause_hypotheses) >= 1
+    assert len(result.memory_matches) >= 1
+    assert len(result.recommended_actions) >= 2
+    assert len(result.cypher_queries_executed) >= 4
+
+

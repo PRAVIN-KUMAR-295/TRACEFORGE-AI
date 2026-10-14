@@ -11,68 +11,62 @@ from backend.app.models.schemas import (
     EvidencePathStep,
     HistoricalIncidentMatch,
     InvestigationResult,
+    ToolExecutionRecord,
+)
+from backend.app.services.investigation_tools import (
+    CypherQueryTool,
+    DependencyCascadeTool,
+    MemoryRetrievalTool,
+    safe_get_dict,
 )
 from backend.app.services.llm_provider import llm_provider
 
 logger = logging.getLogger("traceforge.investigation")
 
 
-def _safe_get_dict(item: Any) -> Dict[str, Any]:
-    """Safely extracts a dictionary of properties from a query row element."""
-    if isinstance(item, dict):
-        return item
-    if hasattr(item, "properties") and isinstance(item.properties, dict):
-        d = dict(item.properties)
-        if hasattr(item, "id") and "id" not in d:
-            d["id"] = str(item.id)
-        return d
-    if hasattr(item, "__dict__"):
-        return dict(item.__dict__)
-    if isinstance(item, str) and item:
-        return {"id": item, "name": item}
-    return {}
+# Preserved for backward compatibility with existing tests
+_safe_get_dict = safe_get_dict
 
 
 class InvestigationEngine:
     """
     Core graph-based incident investigation engine.
-    Executes actual FalkorDB Cypher queries, dynamically parses returned graph
-    structures, separates confirmed facts from hypotheses, and retrieves persistent incident memory.
+    Orchestrates reusable investigation tools (CypherQueryTool, DependencyCascadeTool,
+    MemoryRetrievalTool) with a traceable execution audit trail.
     """
 
-    def __init__(self):
-        self.client = falkor_client
+    def __init__(self, client=None):
+        self.client = client or falkor_client
+        self.cypher_tool = CypherQueryTool(self.client)
+        self.cascade_tool = DependencyCascadeTool(self.cypher_tool)
+        self.memory_tool = MemoryRetrievalTool(self.cypher_tool)
         self.investigation_history: Dict[str, InvestigationResult] = {}
 
     async def investigate_incident(self, incident_id: str, custom_query: Optional[str] = None) -> InvestigationResult:
         start_time = time.perf_counter()
         investigation_id = f"inv_{uuid.uuid4().hex[:10]}"
+
+        tool_execution_trace: List[ToolExecutionRecord] = []
         cypher_logs: List[CypherQueryLog] = []
 
-        confirmed_facts: List[EvidenceItem] = []
-        root_cause_hypotheses: List[EvidenceItem] = []
-        memory_matches: List[HistoricalIncidentMatch] = []
-        recommended_actions: List[ActionPlanItem] = []
-        relationship_paths: List[List[str]] = []
-
         # -------------------------------------------------------------
-        # STEP 1: RETRIEVE PRIMARY INCIDENT
+        # TOOL CALL 1: Retrieve Primary Incident Node
         # -------------------------------------------------------------
+        t1_start = time.perf_counter()
         q1 = "MATCH (i:Incident {id: $incident_id}) RETURN i"
-        res1 = self.client.execute_cypher(q1, {"incident_id": incident_id})
-        cypher_logs.append(
-            CypherQueryLog(
-                cypher=q1,
-                params={"incident_id": incident_id},
-                execution_time_ms=res1["execution_time_ms"],
-                rows_returned=res1["row_count"],
-                purpose="Retrieve primary incident node and baseline telemetry",
-            )
+        res1 = self.cypher_tool.execute(
+            q1,
+            {"incident_id": incident_id},
+            "Retrieve primary incident node and baseline telemetry"
         )
+        t1_elapsed = (time.perf_counter() - t1_start) * 1000.0
+
+        if res1.query_log:
+            cypher_logs.append(res1.query_log)
 
         incident_node: Dict[str, Any] = {}
-        if res1["rows"] and len(res1["rows"][0]) > 0:
-            incident_node = _safe_get_dict(res1["rows"][0][0])
+        if res1.rows and len(res1.rows[0]) > 0:
+            incident_node = safe_get_dict(res1.rows[0][0])
 
         if not incident_node or not incident_node.get("id"):
             incident_node = {
@@ -83,284 +77,62 @@ class InvestigationEngine:
                 "description": custom_query or "Incident record not present in graph topology.",
             }
 
-        # -------------------------------------------------------------
-        # STEP 2: RETRIEVE AFFECTED SERVICES VIA [:AFFECTS]
-        # -------------------------------------------------------------
-        q_aff = "MATCH (i:Incident)-[r:AFFECTS]->(s:Service) WHERE i.id = $incident_id RETURN i, r, s"
-        res_aff = self.client.execute_cypher(q_aff, {"incident_id": incident_id})
-        cypher_logs.append(
-            CypherQueryLog(
-                cypher=q_aff,
-                params={"incident_id": incident_id},
-                execution_time_ms=res_aff["execution_time_ms"],
-                rows_returned=res_aff["row_count"],
-                purpose="Retrieve services directly impacted by this incident",
+        tool_execution_trace.append(
+            ToolExecutionRecord(
+                step_number=1,
+                tool_name="CypherQueryTool",
+                operation="lookup_primary_incident",
+                input_parameters={"incident_id": incident_id},
+                rows_returned=res1.row_count,
+                execution_time_ms=round(t1_elapsed, 2),
+                evidence_items_derived=1 if incident_node.get("title") else 0,
+                summary=f"Primary incident node '{incident_id}' retrieved from FalkorDB." if res1.row_count > 0 else f"No incident node found with ID '{incident_id}'.",
+                status="SUCCESS" if res1.row_count > 0 else "EMPTY",
             )
         )
 
-        affected_services: List[Dict[str, Any]] = []
-        for row in res_aff["rows"]:
-            if len(row) >= 3:
-                svc_dict = _safe_get_dict(row[2])
-                if svc_dict.get("id"):
-                    affected_services.append(svc_dict)
-
-        # Fallback to incident_node['affected_service'] if no explicit [:AFFECTS] edge in graph
-        if not affected_services and incident_node.get("affected_service"):
-            fallback_svc_id = incident_node["affected_service"]
-            q_svc = "MATCH (s:Service {id: $service_id}) RETURN s"
-            res_svc = self.client.execute_cypher(q_svc, {"service_id": fallback_svc_id})
-            if res_svc["rows"] and len(res_svc["rows"][0]) > 0:
-                affected_services.append(_safe_get_dict(res_svc["rows"][0][0]))
-            else:
-                affected_services.append({"id": fallback_svc_id, "name": fallback_svc_id})
-
-        primary_affected_service_id = affected_services[0]["id"] if affected_services else None
-
         # -------------------------------------------------------------
-        # STEP 3: TRAVERSE SERVICE DEPENDENCIES
+        # TOOL CALL 2: Dependency Cascade Exploration
         # -------------------------------------------------------------
-        dependent_services: List[Dict[str, Any]] = []
-        relevant_service_ids = set()
-        if primary_affected_service_id:
-            relevant_service_ids.add(primary_affected_service_id)
-
-        for aff_svc in affected_services:
-            aff_id = aff_svc.get("id")
-            if not aff_id:
-                continue
-
-            q2 = "MATCH (s:Service)-[r:DEPENDS_ON]->(dep:Service) WHERE s.id = $service_id RETURN s, r, dep"
-            res2 = self.client.execute_cypher(q2, {"service_id": aff_id})
-            cypher_logs.append(
-                CypherQueryLog(
-                    cypher=q2,
-                    params={"service_id": aff_id},
-                    execution_time_ms=res2["execution_time_ms"],
-                    rows_returned=res2["row_count"],
-                    purpose=f"Traverse dependencies for affected service '{aff_id}'",
-                )
-            )
-
-            for row in res2["rows"]:
-                if len(row) < 3:
-                    continue
-                s_dict = _safe_get_dict(row[0])
-                r_dict = _safe_get_dict(row[1])
-                dep_dict = _safe_get_dict(row[2])
-
-                dep_id = dep_dict.get("id")
-                s_id = s_dict.get("id", aff_id)
-                if not dep_id:
-                    continue
-
-                dependent_services.append(dep_dict)
-                relevant_service_ids.add(dep_id)
-
-                # Dynamically construct Confirmed Fact from Cypher dependency traversal
-                proto = r_dict.get("type", "RPC/REST")
-                timeout_val = r_dict.get("timeout_ms")
-                timeout_info = f" with {timeout_val}ms SLA timeout" if timeout_val else ""
-
-                confirmed_facts.append(
-                    EvidenceItem(
-                        id=f"fact-dep-{s_id}-{dep_id}",
-                        title=f"Direct Dependency: {s_id} -> {dep_id}",
-                        description=f"Graph topology verifies that {s_id} requires synchronous {proto} calls to {dep_id} for operation{timeout_info}.",
-                        source_node=s_id,
-                        target_node=dep_id,
-                        relationship_type="DEPENDS_ON",
-                        confidence_score=1.0,
-                        is_confirmed_fact=True,
-                        cypher_proof_query=f"MATCH (s:Service {{id: '{s_id}'}})-[r:DEPENDS_ON]->(d:Service {{id: '{dep_id}'}}) RETURN s, r, d",
-                        evidence_path=[
-                            EvidencePathStep(
-                                from_node=s_id,
-                                to_node=dep_id,
-                                relationship="DEPENDS_ON",
-                                explanation=f"{proto} dependency ({'critical' if r_dict.get('critical') else 'standard'}).",
-                            )
-                        ],
-                    )
-                )
-
-        # -------------------------------------------------------------
-        # STEP 4: DETECT INFRASTRUCTURE CONNECTIVITY (Databases/Caches)
-        # -------------------------------------------------------------
-        q3 = "MATCH (s:Service)-[r:CONNECTS_TO]->(infra:Database) RETURN s, r, infra"
-        res3 = self.client.execute_cypher(q3)
-        cypher_logs.append(
-            CypherQueryLog(
-                cypher=q3,
-                params={},
-                execution_time_ms=res3["execution_time_ms"],
-                rows_returned=res3["row_count"],
-                purpose="Retrieve database and caching clusters connected to critical services",
-            )
+        cascade_res = self.cascade_tool.explore(
+            incident_id=incident_id,
+            step_number=2,
+            fallback_service_id=incident_node.get("affected_service")
         )
 
-        connected_infra_nodes: List[Dict[str, Any]] = []
-        for row in res3["rows"]:
-            if len(row) < 3:
-                continue
-            svc_obj = _safe_get_dict(row[0])
-            infra_obj = _safe_get_dict(row[2])
-            s_id = svc_obj.get("id")
-            infra_id = infra_obj.get("id")
+        tool_execution_trace.append(cascade_res.tool_record)
+        cypher_logs.extend(cascade_res.query_logs)
 
-            if s_id and infra_id and s_id in relevant_service_ids:
-                connected_infra_nodes.append(infra_obj)
-                infra_status = infra_obj.get("status", "healthy")
-
-                if infra_status in ("exhausted", "critical", "degraded"):
-                    confirmed_facts.append(
-                        EvidenceItem(
-                            id=f"fact-infra-{infra_id}",
-                            title=f"Infrastructure Saturated: {infra_id}",
-                            description=f"Service {s_id} connects to {infra_id} ({infra_obj.get('type', 'datastore')}) which is currently flagged as {infra_status}.",
-                            source_node=s_id,
-                            target_node=infra_id,
-                            relationship_type="CONNECTS_TO",
-                            confidence_score=0.98,
-                            is_confirmed_fact=True,
-                            cypher_proof_query=f"MATCH (s:Service {{id: '{s_id}'}})-[r:CONNECTS_TO]->(i:Database {{id: '{infra_id}'}}) RETURN s, r, i",
-                            evidence_path=[
-                                EvidencePathStep(
-                                    from_node=s_id,
-                                    to_node=infra_id,
-                                    relationship="CONNECTS_TO",
-                                    explanation=f"{infra_obj.get('type', 'Datastore')} status: {infra_status}",
-                                )
-                            ],
-                        )
-                    )
-
-        # -------------------------------------------------------------
-        # STEP 5: DETECT RECENT DEPLOYMENTS ALONG DEPENDENCY CHAIN
-        # -------------------------------------------------------------
-        q4 = "MATCH (d:Deployment)-[r:DEPLOYED_TO]->(s:Service) RETURN d, r, s"
-        res4 = self.client.execute_cypher(q4)
-        cypher_logs.append(
-            CypherQueryLog(
-                cypher=q4,
-                params={},
-                execution_time_ms=res4["execution_time_ms"],
-                rows_returned=res4["row_count"],
-                purpose="Inspect recent code deployments across dependency tree",
-            )
+        confirmed_facts = cascade_res.confirmed_facts
+        relevant_deployments = cascade_res.deployments
+        connected_infra_nodes = cascade_res.connected_infra
+        error_patterns = cascade_res.error_patterns
+        detected_metrics = cascade_res.metrics
+        relationship_paths = cascade_res.relationship_paths
+        primary_affected_service_id = (
+            cascade_res.affected_services[0]["id"]
+            if cascade_res.affected_services
+            else incident_node.get("affected_service")
         )
 
-        relevant_deployments: List[Dict[str, Any]] = []
-        for row in res4["rows"]:
-            if len(row) < 3:
-                continue
-            dep_obj = _safe_get_dict(row[0])
-            svc_obj = _safe_get_dict(row[2])
-            s_id = svc_obj.get("id")
-            d_id = dep_obj.get("id")
-
-            if s_id and d_id and s_id in relevant_service_ids:
-                relevant_deployments.append({**dep_obj, "target_service": s_id})
-                deployed_when = dep_obj.get("deployed_at", "recently")
-                change_summary = dep_obj.get("change_summary", "Configuration or code release")
-
-                confirmed_facts.append(
-                    EvidenceItem(
-                        id=f"fact-deploy-{d_id}",
-                        title=f"Recent Production Deployment: {d_id}",
-                        description=f"FalkorDB records show deployment {d_id} ({dep_obj.get('version', '')}) committed {deployed_when} to {s_id}: '{change_summary}'.",
-                        source_node=d_id,
-                        target_node=s_id,
-                        relationship_type="DEPLOYED_TO",
-                        confidence_score=1.0,
-                        is_confirmed_fact=True,
-                        cypher_proof_query=f"MATCH (d:Deployment {{id: '{d_id}'}})-[:DEPLOYED_TO]->(s:Service {{id: '{s_id}'}}) RETURN d, s",
-                        evidence_path=[
-                            EvidencePathStep(
-                                from_node=d_id,
-                                to_node=s_id,
-                                relationship="DEPLOYED_TO",
-                                explanation=f"Committed {deployed_when}: {change_summary}",
-                            )
-                        ],
-                    )
-                )
-
         # -------------------------------------------------------------
-        # STEP 6: RETRIEVE ACTIVE ERROR PATTERNS & METRIC ANOMALIES
+        # TOOL CALL 3: Historical Incident Memory Retrieval
         # -------------------------------------------------------------
-        q5 = "MATCH (i:Incident)-[r:TRIGGERED_BY]->(e:ErrorPattern) WHERE i.id = $incident_id RETURN i, r, e"
-        res5 = self.client.execute_cypher(q5, {"incident_id": incident_id})
-        cypher_logs.append(
-            CypherQueryLog(
-                cypher=q5,
-                params={"incident_id": incident_id},
-                execution_time_ms=res5["execution_time_ms"],
-                rows_returned=res5["row_count"],
-                purpose="Correlate active error patterns linked to incident",
-            )
+        memory_res = self.memory_tool.retrieve(
+            incident_id=incident_id,
+            step_number=3
         )
 
-        error_patterns: List[Dict[str, Any]] = []
-        for row in res5["rows"]:
-            if len(row) >= 3:
-                err_obj = _safe_get_dict(row[2])
-                if err_obj.get("id"):
-                    error_patterns.append(err_obj)
-
-        # Query metric anomalies affecting the relevant service tree
-        q_metric = "MATCH (m:MetricAnomaly)-[r:AFFECTS]->(s:Service) RETURN m, r, s"
-        res_metric = self.client.execute_cypher(q_metric)
-        cypher_logs.append(
-            CypherQueryLog(
-                cypher=q_metric,
-                params={},
-                execution_time_ms=res_metric["execution_time_ms"],
-                rows_returned=res_metric["row_count"],
-                purpose="Retrieve metric anomalies affecting services in dependency tree",
-            )
-        )
-
-        detected_metrics: List[Dict[str, Any]] = []
-        for row in res_metric["rows"]:
-            if len(row) < 3:
-                continue
-            m_obj = _safe_get_dict(row[0])
-            s_obj = _safe_get_dict(row[2])
-            s_id = s_obj.get("id")
-            m_id = m_obj.get("id")
-
-            if s_id and m_id and s_id in relevant_service_ids:
-                detected_metrics.append({**m_obj, "target_service": s_id})
-                m_score = float(m_obj.get("anomaly_score", 0.95))
-
-                confirmed_facts.append(
-                    EvidenceItem(
-                        id=f"fact-metric-{m_id}",
-                        title=f"Telemetry Anomaly: {m_obj.get('name', m_id)}",
-                        description=f"Telemetry node {m_id} confirms metric {m_obj.get('metric')}: {m_obj.get('value')} exceeding baseline threshold {m_obj.get('threshold')} on {s_id}.",
-                        source_node=m_id,
-                        target_node=s_id,
-                        relationship_type="AFFECTS",
-                        confidence_score=round(m_score, 2),
-                        is_confirmed_fact=True,
-                        cypher_proof_query=f"MATCH (m:MetricAnomaly {{id: '{m_id}'}})-[:AFFECTS]->(s:Service {{id: '{s_id}'}}) RETURN m, s",
-                        evidence_path=[
-                            EvidencePathStep(
-                                from_node=m_id,
-                                to_node=s_id,
-                                relationship="AFFECTS",
-                                explanation=f"Anomaly score {m_score} on {s_id}",
-                            )
-                        ],
-                    )
-                )
+        tool_execution_trace.append(memory_res.tool_record)
+        cypher_logs.extend(memory_res.query_logs)
+        memory_matches = memory_res.matches
 
         # -------------------------------------------------------------
-        # STEP 7: DYNAMIC ROOT-CAUSE HYPOTHESES SYNTHESIS
+        # SYNTHESIS: Root-Cause Hypotheses Formulation
         # -------------------------------------------------------------
+        root_cause_hypotheses: List[EvidenceItem] = []
+
         if relevant_deployments:
-            # Deployment-driven causal hypothesis
             top_dep = relevant_deployments[0]
             dep_id = top_dep.get("id", "deployment")
             dep_svc = top_dep.get("target_service", primary_affected_service_id or "service")
@@ -422,7 +194,6 @@ class InvestigationEngine:
                 )
             )
 
-            # Secondary / Alternative hypothesis
             if connected_infra_nodes:
                 infra_id = connected_infra_nodes[0].get("id", "infrastructure")
                 root_cause_hypotheses.append(
@@ -448,7 +219,6 @@ class InvestigationEngine:
                 )
 
         elif detected_metrics or error_patterns:
-            # Anomaly/Error-driven hypothesis without recent deployment
             lead_metric = detected_metrics[0] if detected_metrics else None
             m_target = lead_metric.get("target_service") if lead_metric else (primary_affected_service_id or "service")
             m_name = lead_metric.get("name", "Metric Anomaly") if lead_metric else "Error Pattern Spike"
@@ -475,7 +245,6 @@ class InvestigationEngine:
                 )
             )
         else:
-            # Fallback when graph has no anomalies/deployments for this incident
             root_cause_hypotheses.append(
                 EvidenceItem(
                     id="hyp-no-evidence",
@@ -492,69 +261,10 @@ class InvestigationEngine:
             )
 
         # -------------------------------------------------------------
-        # STEP 8: RETRIEVE PERSISTENT INCIDENT MEMORY MATCHES
+        # SYNTHESIS: Actionable Recommendations (Human-in-the-Loop)
         # -------------------------------------------------------------
-        q6 = "MATCH (i:Incident)-[r:SIMILAR_TO]->(h:Incident) WHERE i.id = $incident_id RETURN i, r, h"
-        res6 = self.client.execute_cypher(q6, {"incident_id": incident_id})
-        cypher_logs.append(
-            CypherQueryLog(
-                cypher=q6,
-                params={"incident_id": incident_id},
-                execution_time_ms=res6["execution_time_ms"],
-                rows_returned=res6["row_count"],
-                purpose="Retrieve historical incident memory and validated resolution precedents",
-            )
-        )
+        recommended_actions: List[ActionPlanItem] = []
 
-        for row in res6["rows"]:
-            if len(row) < 3:
-                continue
-            r_obj = _safe_get_dict(row[1])
-            h_obj = _safe_get_dict(row[2])
-            h_id = h_obj.get("id")
-            if not h_id:
-                continue
-
-            sim_score = float(r_obj.get("similarity", 0.75))
-            pattern_note = r_obj.get("pattern", "shared failure symptoms and topology")
-
-            # Query resolution node linked to this historical incident
-            q_res = "MATCH (h:Incident)-[r:RESOLVED_BY]->(res:Resolution) WHERE h.id = $hist_id RETURN h, r, res"
-            res_res = self.client.execute_cypher(q_res, {"hist_id": h_id})
-
-            res_strategy = h_obj.get("resolution_strategy")
-            transfer_fix = h_obj.get("transferrable_fix")
-
-            if res_res["rows"] and len(res_res["rows"][0]) >= 3:
-                res_node = _safe_get_dict(res_res["rows"][0][2])
-                if not res_strategy:
-                    res_strategy = res_node.get("strategy") or res_node.get("title")
-                if not transfer_fix:
-                    transfer_fix = res_node.get("fix") or res_node.get("action")
-
-            if not res_strategy:
-                res_strategy = "Apply known postmortem configuration fix."
-            if not transfer_fix:
-                transfer_fix = "Review service configuration parameters."
-
-            memory_matches.append(
-                HistoricalIncidentMatch(
-                    incident_id=h_id,
-                    title=h_obj.get("title", f"Historical Incident {h_id}"),
-                    similarity_score=round(sim_score, 2),
-                    resolved_at=h_obj.get("resolved_at"),
-                    root_cause_summary=h_obj.get("root_cause_summary", "Past incident resolution record"),
-                    resolution_strategy=res_strategy,
-                    transferrable_fix=transfer_fix,
-                    proof_path=f"{incident_id} -[:SIMILAR_TO {{similarity: {sim_score}}}]-> {h_id}",
-                    influence_explanation=f"Incident {h_id} shares pattern: '{pattern_note}'. Its verified resolution strategy directly informs our current mitigation recommendation.",
-                )
-            )
-
-        # -------------------------------------------------------------
-        # STEP 9: ACTIONABLE RECOMMENDATIONS (Human-in-the-Loop)
-        # -------------------------------------------------------------
-        # Action 1: If historical memory match provides transferrable fix
         if memory_matches:
             top_match = memory_matches[0]
             target_svc = relevant_deployments[0].get("target_service") if relevant_deployments else (primary_affected_service_id or "service")
@@ -573,7 +283,6 @@ class InvestigationEngine:
                 )
             )
 
-        # Action 2: If a recent deployment was identified in causal chain
         if relevant_deployments:
             target_dep = relevant_deployments[0]
             d_id = target_dep.get("id", "deployment")
@@ -593,7 +302,6 @@ class InvestigationEngine:
                 )
             )
 
-        # Action 3: Circuit breaker reset if error patterns or downstream cascade exists
         if error_patterns and primary_affected_service_id:
             recommended_actions.append(
                 ActionPlanItem(
@@ -610,7 +318,6 @@ class InvestigationEngine:
                 )
             )
 
-        # Fallback action if no specific recommendations derived
         if not recommended_actions:
             target_svc = primary_affected_service_id or "system"
             recommended_actions.append(
@@ -629,30 +336,7 @@ class InvestigationEngine:
             )
 
         # -------------------------------------------------------------
-        # STEP 10: RELATIONSHIP PATHS
-        # -------------------------------------------------------------
-        if relevant_deployments and connected_infra_nodes:
-            d_id = relevant_deployments[0].get("id")
-            s_id = relevant_deployments[0].get("target_service")
-            i_id = connected_infra_nodes[0].get("id")
-            relationship_paths.append([d_id, s_id, i_id])
-
-        if relevant_deployments and primary_affected_service_id:
-            s_id = relevant_deployments[0].get("target_service")
-            if s_id != primary_affected_service_id:
-                relationship_paths.append([s_id, primary_affected_service_id])
-
-        for fact in confirmed_facts:
-            if fact.relationship_type == "DEPENDS_ON" and fact.source_node and fact.target_node:
-                p = [fact.source_node, fact.target_node]
-                if p not in relationship_paths:
-                    relationship_paths.append(p)
-
-        if not relationship_paths and primary_affected_service_id:
-            relationship_paths.append([primary_affected_service_id])
-
-        # -------------------------------------------------------------
-        # STEP 11: LLM SYNTHESIS / REASONING INTEGRATION
+        # LLM Synthesis / Reasoning Integration
         # -------------------------------------------------------------
         llm_analysis = await llm_provider.analyze_incident_graph(
             incident_data=incident_node,
@@ -674,7 +358,7 @@ class InvestigationEngine:
         summary_text = (
             llm_analysis.get("summary")
             if llm_analysis.get("summary") and len(confirmed_facts) > 0
-            else f"TRACEFORGE AI evaluated graph relationships for {incident_id}. Derived {len(confirmed_facts)} confirmed facts and {len(root_cause_hypotheses)} hypotheses."
+            else f"TRACEFORGE AI evaluated graph relationships for {incident_id}. Derived {len(confirmed_facts)} confirmed facts and {len(root_cause_hypotheses)} hypotheses across {len(tool_execution_trace)} investigation tool steps."
         )
 
         result = InvestigationResult(
@@ -690,6 +374,7 @@ class InvestigationEngine:
             memory_matches=memory_matches,
             recommended_actions=recommended_actions,
             cypher_queries_executed=cypher_logs,
+            tool_execution_trace=tool_execution_trace,
             execution_time_ms=round(total_exec_time, 2),
             llm_provider_used=llm_provider.provider,
         )

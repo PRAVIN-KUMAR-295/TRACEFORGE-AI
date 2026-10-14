@@ -144,6 +144,18 @@ class CypherQueryLog(BaseModel):
     purpose: str
 
 
+class ToolExecutionRecord(BaseModel):
+    step_number: int
+    tool_name: str
+    operation: str
+    input_parameters: Dict[str, Any] = Field(default_factory=dict)
+    rows_returned: int
+    execution_time_ms: float
+    evidence_items_derived: int
+    summary: str
+    status: str = "SUCCESS"  # SUCCESS, EMPTY, ERROR
+
+
 class InvestigationResult(BaseModel):
     investigation_id: str
     incident_id: str
@@ -157,6 +169,7 @@ class InvestigationResult(BaseModel):
     memory_matches: List[HistoricalIncidentMatch]
     recommended_actions: List[ActionPlanItem]
     cypher_queries_executed: List[CypherQueryLog]
+    tool_execution_trace: List[ToolExecutionRecord] = Field(default_factory=list)
     execution_time_ms: float
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     llm_provider_used: str = "demo"
