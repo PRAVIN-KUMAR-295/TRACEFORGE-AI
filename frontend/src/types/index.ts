@@ -111,6 +111,18 @@ export interface CypherQueryLog {
   purpose: string;
 }
 
+export interface ToolExecutionRecord {
+  step_number: number;
+  tool_name: string;
+  operation: string;
+  input_parameters?: Record<string, any>;
+  rows_returned?: number;
+  execution_time_ms?: number;
+  evidence_items_derived?: number;
+  summary?: string;
+  status?: string;
+}
+
 export interface InvestigationResult {
   investigation_id: string;
   incident_id: string;
@@ -124,6 +136,7 @@ export interface InvestigationResult {
   memory_matches: HistoricalIncidentMatch[];
   recommended_actions: ActionPlanItem[];
   cypher_queries_executed: CypherQueryLog[];
+  tool_execution_trace?: ToolExecutionRecord[];
   execution_time_ms: number;
   created_at: string;
   llm_provider_used: string;

@@ -17,6 +17,7 @@ import { IncidentMemoryDrawer } from '../components/IncidentMemoryDrawer';
 import { RemediationPanel } from '../components/RemediationPanel';
 import { GraphVisualizer } from '../components/GraphVisualizer';
 import { CypherQueryConsole } from '../components/CypherQueryConsole';
+import { ToolExecutionTraceCard } from '../components/ToolExecutionTraceCard';
 
 interface InvestigationDetailViewProps {
   investigation: InvestigationResult;
@@ -134,6 +135,11 @@ export const InvestigationDetailView: React.FC<InvestigationDetailViewProps> = (
           onApproveAction={onApproveAction}
           isProcessingAction={isProcessingAction}
         />
+      </div>
+
+      {/* Agent Tool Execution Trace */}
+      <div>
+        <ToolExecutionTraceCard trace={investigation.tool_execution_trace || []} />
       </div>
 
       {/* Cypher Execution Trace Log */}
