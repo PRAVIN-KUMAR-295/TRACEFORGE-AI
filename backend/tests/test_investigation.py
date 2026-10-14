@@ -207,18 +207,72 @@ async def test_dependency_cascade_tool_graph_traversal():
 async def test_memory_retrieval_tool_grounded_records():
     from backend.app.services.investigation_tools import memory_retrieval_tool
 
-    # Precedent match for INC-2026-1042 auth service
+    # Case 1: Precedent match with verified resolution (INC-2026-1042 -> INC-2026-0814)
     res = memory_retrieval_tool.retrieve(incident_id="INC-2026-1042", step_number=3)
     assert len(res.matches) >= 1
-    assert res.matches[0].incident_id == "INC-2026-0814"
-    assert "Redis" in res.matches[0].root_cause_summary
+    top_match = res.matches[0]
+    assert top_match.incident_id == "INC-2026-0814"
+    assert "Redis" in top_match.root_cause_summary
+    assert not top_match.resolution_strategy.startswith("UNAVAILABLE")
+    assert not top_match.resolution_strategy.startswith("UNVERIFIED")
+    assert not top_match.transferrable_fix.startswith("UNAVAILABLE")
+    assert not top_match.transferrable_fix.startswith("UNVERIFIED")
+    assert "verified resolution strategy directly informs" in top_match.influence_explanation
     assert len(res.query_logs) >= 1
     assert res.tool_record.tool_name == "MemoryRetrievalTool"
+    assert res.tool_record.status == "SUCCESS"
 
-    # Empty match for totally unrelated non-existent incident
+    # Case 2: Similar incident with NO linked Resolution node
+    g = falkor_client.memory_engine
+    g.add_node("INC-TEST-NO-RES-SRC", "Incident", {"id": "INC-TEST-NO-RES-SRC", "title": "Kafka Lag Event"})
+    g.add_node("INC-TEST-NO-RES-TARGET", "Incident", {
+        "id": "INC-TEST-NO-RES-TARGET",
+        "title": "Historical Kafka Crash (Unresolved)",
+        "root_cause_summary": "Unpartitioned stream starved disk."
+    })
+    g.add_edge("INC-TEST-NO-RES-SRC", "INC-TEST-NO-RES-TARGET", "SIMILAR_TO", {
+        "similarity": 0.88,
+        "pattern": "Kafka topic starvation"
+    })
+
+    res_no_res = memory_retrieval_tool.retrieve(incident_id="INC-TEST-NO-RES-SRC", step_number=3)
+    assert len(res_no_res.matches) == 1
+    no_res_match = res_no_res.matches[0]
+    assert no_res_match.incident_id == "INC-TEST-NO-RES-TARGET"
+    assert no_res_match.resolution_strategy.startswith("UNAVAILABLE:")
+    assert no_res_match.transferrable_fix.startswith("UNAVAILABLE:")
+    assert "no recorded resolution in graph memory" in no_res_match.influence_explanation
+    assert "Apply known postmortem configuration fix" not in no_res_match.resolution_strategy
+
+    # Case 3: Linked Resolution node with missing/empty properties
+    g.add_node("INC-TEST-EMPTY-SRC", "Incident", {"id": "INC-TEST-EMPTY-SRC", "title": "Memory Leak Anomaly"})
+    g.add_node("INC-TEST-EMPTY-TARGET", "Incident", {
+        "id": "INC-TEST-EMPTY-TARGET",
+        "title": "Historical Memory Anomaly",
+        "root_cause_summary": "Heap fragmentation in JVM worker."
+    })
+    g.add_node("RES-EMPTY-NODE", "Resolution", {"id": "RES-EMPTY-NODE"})  # No strategy or fix properties
+    g.add_edge("INC-TEST-EMPTY-SRC", "INC-TEST-EMPTY-TARGET", "SIMILAR_TO", {
+        "similarity": 0.82,
+        "pattern": "Heap saturation"
+    })
+    g.add_edge("INC-TEST-EMPTY-TARGET", "RES-EMPTY-NODE", "RESOLVED_BY", {})
+
+    res_empty = memory_retrieval_tool.retrieve(incident_id="INC-TEST-EMPTY-SRC", step_number=3)
+    assert len(res_empty.matches) == 1
+    empty_match = res_empty.matches[0]
+    assert empty_match.incident_id == "INC-TEST-EMPTY-TARGET"
+    assert empty_match.resolution_strategy.startswith("UNVERIFIED:")
+    assert empty_match.transferrable_fix.startswith("UNVERIFIED:")
+    assert "fix parameters are unrecorded" in empty_match.influence_explanation
+    assert "Review service configuration parameters" not in empty_match.transferrable_fix
+
+    # Case 4: No similar incident matches in graph
     empty_res = memory_retrieval_tool.retrieve(incident_id="INC-NONEXISTENT", step_number=3)
     assert len(empty_res.matches) == 0
     assert empty_res.tool_record.status == "EMPTY"
+    assert "No historical incident precedents matched" in empty_res.tool_record.summary
+
 
 
 @pytest.mark.asyncio

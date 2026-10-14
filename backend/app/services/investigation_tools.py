@@ -478,18 +478,44 @@ class MemoryRetrievalTool:
 
             res_strategy = h_obj.get("resolution_strategy")
             transfer_fix = h_obj.get("transferrable_fix")
+            has_resolution_node = False
 
             if res_res.rows and len(res_res.rows[0]) >= 3:
+                has_resolution_node = True
                 res_node = safe_get_dict(res_res.rows[0][2])
                 if not res_strategy:
                     res_strategy = res_node.get("strategy") or res_node.get("title")
                 if not transfer_fix:
                     transfer_fix = res_node.get("fix") or res_node.get("action")
 
-            if not res_strategy:
-                res_strategy = "Apply known postmortem configuration fix."
-            if not transfer_fix:
-                transfer_fix = "Review service configuration parameters."
+            has_verified_fix = bool(
+                (res_strategy and str(res_strategy).strip()) or
+                (transfer_fix and str(transfer_fix).strip())
+            )
+
+            if has_verified_fix:
+                if not res_strategy or not str(res_strategy).strip():
+                    res_strategy = "Verified resolution record present without separate strategy narrative."
+                if not transfer_fix or not str(transfer_fix).strip():
+                    transfer_fix = "Verified resolution record present without specific automated config fix."
+                influence_explanation = (
+                    f"Incident {h_id} shares pattern: '{pattern_note}'. "
+                    f"Its verified resolution strategy directly informs our mitigation recommendation."
+                )
+            elif has_resolution_node:
+                res_strategy = "UNVERIFIED: Resolution node is linked in graph memory but contains empty or missing strategy properties."
+                transfer_fix = "UNVERIFIED: Linked resolution node contains no actionable fix parameters."
+                influence_explanation = (
+                    f"Incident {h_id} shares pattern: '{pattern_note}' and references a resolution node, "
+                    f"but its fix parameters are unrecorded in graph memory."
+                )
+            else:
+                res_strategy = "UNAVAILABLE: No documented resolution recorded in graph memory for this historical incident."
+                transfer_fix = "UNAVAILABLE: No verified transferable fix recorded in graph memory."
+                influence_explanation = (
+                    f"Incident {h_id} shares failure pattern: '{pattern_note}' (similarity {sim_score}), "
+                    f"but has no recorded resolution in graph memory. Caution: manual investigation required before taking action."
+                )
 
             matches.append(
                 HistoricalIncidentMatch(
@@ -501,7 +527,7 @@ class MemoryRetrievalTool:
                     resolution_strategy=res_strategy,
                     transferrable_fix=transfer_fix,
                     proof_path=f"{incident_id} -[:SIMILAR_TO {{similarity: {sim_score}}}]-> {h_id}",
-                    influence_explanation=f"Incident {h_id} shares pattern: '{pattern_note}'. Its verified resolution strategy directly informs our current mitigation recommendation.",
+                    influence_explanation=influence_explanation,
                 )
             )
 
