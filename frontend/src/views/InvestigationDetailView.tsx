@@ -36,7 +36,7 @@ export const InvestigationDetailView: React.FC<InvestigationDetailViewProps> = (
   isProcessingAction
 }) => {
   const [highlightPath, setHighlightPath] = useState<string[]>(
-    investigation.relationship_paths[0] || []
+    investigation.relationship_paths?.[0] || []
   );
 
   return (

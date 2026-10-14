@@ -95,9 +95,11 @@ class FalkorMemoryGraphEngine:
         # Check for simple MATCH (n) or MATCH (n:Label) RETURN n
         node_match = re.search(r"MATCH\s*\(([a-zA-Z0-9_]+)(?::([a-zA-Z0-9_]+))?\s*(?:\{([^}]+)\})?\)\s*(?:WHERE\s+([^\s]+(?:\s*[=><!]+\s*[^\s]+)?))?\s*RETURN\s+([a-zA-Z0-9_,\.\s]+)", cypher_clean, re.IGNORECASE)
         
-        # Check for relationship match: (a)-[r:REL]->(b) or (a)-[:REL]->(b)
+        # Check for relationship match: (a)-[r:REL]->(b) or (a)-[:REL]->(b) with optional property maps
         rel_match = re.search(
-            r"MATCH\s*\(([a-zA-Z0-9_]+)?(?::([a-zA-Z0-9_]+))?\)\s*-\[([a-zA-Z0-9_]+)?(?::([a-zA-Z0-9_]+))?\]->\s*\(([a-zA-Z0-9_]+)?(?::([a-zA-Z0-9_]+))?\)"
+            r"MATCH\s*\(([a-zA-Z0-9_]+)?(?::([a-zA-Z0-9_]+))?\s*(?:\{([^}]+)\})?\)\s*"
+            r"-\[([a-zA-Z0-9_]+)?(?::([a-zA-Z0-9_]+))?\s*(?:\{([^}]+)\})?\]->\s*"
+            r"\(([a-zA-Z0-9_]+)?(?::([a-zA-Z0-9_]+))?\s*(?:\{([^}]+)\})?\)"
             r"(?:\s*WHERE\s+(.*?))?"
             r"\s*RETURN\s+(.*)",
             cypher_clean,
@@ -151,12 +153,15 @@ class FalkorMemoryGraphEngine:
     def _execute_rel_query(self, match: re.Match, raw_query: str) -> Tuple[List[str], List[List[Any]]]:
         src_var = match.group(1) or "a"
         src_label = match.group(2)
-        rel_var = match.group(3) or "r"
-        rel_type = match.group(4)
-        tgt_var = match.group(5) or "b"
-        tgt_label = match.group(6)
-        where_str = match.group(7)
-        return_str = match.group(8)
+        src_props_str = match.group(3)
+        rel_var = match.group(4) or "r"
+        rel_type = match.group(5)
+        rel_props_str = match.group(6)
+        tgt_var = match.group(7) or "b"
+        tgt_label = match.group(8)
+        tgt_props_str = match.group(9)
+        where_str = match.group(10)
+        return_str = match.group(11)
 
         columns = [c.strip() for c in return_str.split(",")]
         results = []
@@ -174,6 +179,20 @@ class FalkorMemoryGraphEngine:
                 continue
             if tgt_label and tgt_node.label.lower() != tgt_label.lower():
                 continue
+
+            # Evaluate inline property maps
+            if src_props_str:
+                props = self._parse_props_string(src_props_str)
+                if not all(str(src_node.properties.get(k, "")).lower() == str(v).lower() for k, v in props.items()):
+                    continue
+            if tgt_props_str:
+                props = self._parse_props_string(tgt_props_str)
+                if not all(str(tgt_node.properties.get(k, "")).lower() == str(v).lower() for k, v in props.items()):
+                    continue
+            if rel_props_str:
+                props = self._parse_props_string(rel_props_str)
+                if not all(str(edge.properties.get(k, "")).lower() == str(v).lower() for k, v in props.items()):
+                    continue
 
             # Evaluate WHERE conditions
             if where_str:

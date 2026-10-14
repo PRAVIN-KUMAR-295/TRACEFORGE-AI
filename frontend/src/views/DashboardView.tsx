@@ -214,7 +214,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <p className="text-[11px] text-slate-400 line-clamp-2">{inv.primary_root_cause}</p>
                   <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 pt-1 border-t border-dark-750">
                     <span>{inv.execution_time_ms}ms</span>
-                    <span>{inv.confirmed_facts.length} facts / {inv.recommended_actions.length} actions</span>
+                    <span>{(inv.confirmed_facts || []).length} facts / {(inv.recommended_actions || []).length} actions</span>
                   </div>
                 </div>
               ))

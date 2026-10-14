@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 
@@ -46,12 +46,14 @@ class EdgeType(str, Enum):
     DEPLOYED_TO = "DEPLOYED_TO"
     CONNECTS_TO = "CONNECTS_TO"
     PROPAGATES_TO = "PROPAGATES_TO"
+    SIMILAR_TO = "SIMILAR_TO"
 
 
 class GraphNode(BaseModel):
     id: str
     label: str
-    type: NodeType
+    name: Optional[str] = None
+    type: Optional[str] = None
     properties: Dict[str, Any] = Field(default_factory=dict)
     status: Optional[str] = "healthy"
     description: Optional[str] = None
@@ -61,7 +63,7 @@ class GraphEdge(BaseModel):
     id: str
     source: str
     target: str
-    type: EdgeType
+    type: Union[EdgeType, str]
     properties: Dict[str, Any] = Field(default_factory=dict)
     weight: Optional[float] = 1.0
 
