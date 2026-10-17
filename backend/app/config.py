@@ -1,4 +1,6 @@
-from typing import List, Optional
+import json
+from typing import Any, List, Optional, Union
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,8 +36,27 @@ class Settings(BaseSettings):
 
     # Server Configuration
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
-    cors_origins: List[str] = ["*"]
+    api_port: int = Field(default=8000, validation_alias=AliasChoices("api_port", "port", "PORT"))
+    cors_origins: Union[List[str], str] = ["*"]
+
+    @field_validator("cors_origins", mode="after")
+    @classmethod
+    def normalize_cors_origins(cls, v: Any) -> List[str]:
+        if isinstance(v, str):
+            v = v.strip()
+            if not v:
+                return ["*"]
+            if v.startswith("[") and v.endswith("]"):
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    pass
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        elif isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return ["*"]
 
     model_config = SettingsConfigDict(
         env_file=".env",

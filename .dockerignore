@@ -1,0 +1,31 @@
+# Environments and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache & virtualenvs
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Excluded scripts & local databases
+scripts/
+*.rdb
+*.db
+*.sqlite
+
+# Frontend artifacts
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+
+# Git & IDE
+.git/
+.vscode/
+.idea/
+*.log

@@ -4,7 +4,8 @@ import {
   SystemHealthStatus,
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL !== undefined ? import.meta.env.VITE_API_URL : '';
+const rawBaseUrl = import.meta.env.VITE_API_URL !== undefined ? import.meta.env.VITE_API_URL : '';
+const API_BASE_URL = rawBaseUrl.endsWith('/') ? rawBaseUrl.slice(0, -1) : rawBaseUrl;
 
 export async function fetchHealth(): Promise<SystemHealthStatus> {
   const res = await fetch(`${API_BASE_URL}/api/health`);

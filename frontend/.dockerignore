@@ -1,0 +1,15 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Node dependencies and build output
+node_modules/
+dist/
+.npm/
+npm-debug.log*
+
+# Git and IDE
+.git/
+.vscode/
+.idea/
