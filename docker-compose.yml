@@ -1,0 +1,21 @@
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: traceforge-falkordb
+    ports:
+      - "127.0.0.1:${FALKORDB_PORT:-6379}:6379"
+    environment:
+      - FALKORDB_ARGS=--maxmemory 512mb
+    volumes:
+      - falkordb-data:/var/lib/falkordb/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+    restart: unless-stopped
+
+volumes:
+  falkordb-data:
+    name: traceforge-falkordb-data

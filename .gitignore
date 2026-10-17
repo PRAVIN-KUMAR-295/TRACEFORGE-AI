@@ -1,14 +1,37 @@
-# Python
+# Python & Virtual Environments
 __pycache__/
 *.py[cod]
 *$py.class
 venv/
-.env
+.venv/
+env/
 *.log
 .pytest_cache/
+.coverage
+htmlcov/
 
-# Node
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+
+# Local Database Files & Snapshots
+*.rdb
+*.db
+*.sqlite
+*.sqlite3
+
+# Node & Frontend Build Artifacts
 frontend/node_modules/
+node_modules/
 frontend/dist/
+dist/
 frontend/.tmp/
+.npm
+npm-debug.log*
+
+# Operating System & IDE
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -95,6 +95,29 @@ class PersistentMemoryService:
         g.add_edge(incident_id, affected_service, "AFFECTS", {"status": "historical"})
         g.add_edge(incident_id, res_id, "RESOLVED_BY", {"applied": True})
 
+        # Sync to live FalkorDB if connected and not read-only
+        if self.client.is_connected and self.client.live_graph and not getattr(self.client, "read_only", False):
+            try:
+                live_props = {k: v for k, v in incident_props.items() if k != "impacted_services"}
+                self.client.live_graph.query(
+                    "MERGE (i:Incident {id: $id}) SET i += $props",
+                    {"id": incident_id, "props": live_props}
+                )
+                self.client.live_graph.query(
+                    "MERGE (r:Resolution {id: $id}) SET r += $props",
+                    {"id": res_id, "props": {"id": res_id, "title": f"Resolution for {incident_id}", "strategy": resolution_strategy, "fix": transferrable_fix}}
+                )
+                self.client.live_graph.query(
+                    "MATCH (i:Incident {id: $iid}), (s:Service {id: $sid}) MERGE (i)-[rel:AFFECTS]->(s) SET rel.status = 'historical'",
+                    {"iid": incident_id, "sid": affected_service}
+                )
+                self.client.live_graph.query(
+                    "MATCH (i:Incident {id: $iid}), (r:Resolution {id: $rid}) MERGE (i)-[rel:RESOLVED_BY]->(r) SET rel.applied = true",
+                    {"iid": incident_id, "rid": res_id}
+                )
+            except Exception as e:
+                logger.warning(f"Failed to sync postmortem to live FalkorDB: {e}")
+
         logger.info(f"Stored incident {incident_id} and resolution {res_id} in FalkorDB persistent memory.")
 
         return {

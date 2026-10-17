@@ -25,9 +25,12 @@ async def get_health_status():
         "falkordb": {
             "is_live_connected": falkor_client.is_connected,
             "engine_mode": falkor_client.engine_type,
+            "host": falkor_client.host,
+            "port": falkor_client.port,
+            "graph_name": settings.falkordb_graph_name,
             "total_nodes": topo["total_nodes"],
             "total_edges": topo["total_edges"],
-            "graph_name": settings.falkordb_graph_name,
+            "connection_error": getattr(falkor_client, "connection_error", None),
         },
         "llm": {
             "provider": llm_provider.provider,

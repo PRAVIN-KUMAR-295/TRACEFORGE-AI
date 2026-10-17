@@ -79,6 +79,27 @@ class CypherQueryTool:
             res = self.client.execute_cypher(query, params)
             elapsed = (time.perf_counter() - start_time) * 1000.0
 
+            if res.get("error"):
+                err_msg = res["error"]
+                logger.error(f"CypherQueryTool execution failure: {err_msg}")
+                q_log = CypherQueryLog(
+                    cypher=query,
+                    params=safe_params,
+                    execution_time_ms=res.get("execution_time_ms", round(elapsed, 2)),
+                    rows_returned=0,
+                    purpose=f"{purpose} (FAILED: {err_msg})",
+                )
+                return CypherToolResult(
+                    success=False,
+                    columns=[],
+                    rows=[],
+                    row_count=0,
+                    execution_time_ms=res.get("execution_time_ms", round(elapsed, 2)),
+                    engine=res.get("engine", "FalkorDB"),
+                    error=err_msg,
+                    query_log=q_log,
+                )
+
             q_log = CypherQueryLog(
                 cypher=query,
                 params=safe_params,

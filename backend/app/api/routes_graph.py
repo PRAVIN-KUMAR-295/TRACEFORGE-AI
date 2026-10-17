@@ -44,6 +44,8 @@ async def execute_cypher(req: CypherExecuteRequest):
     """
     try:
         res = falkor_client.execute_cypher(req.query, req.params)
+        if res.get("error"):
+            raise HTTPException(status_code=400, detail=f"Cypher execution error: {res['error']}")
         return CypherExecuteResponse(
             query=req.query,
             results=[dict(zip(res["columns"], row)) if isinstance(row, list) else {"data": row} for row in res["rows"]],
@@ -52,5 +54,31 @@ async def execute_cypher(req: CypherExecuteRequest):
             execution_time_ms=res["execution_time_ms"],
             engine=res["engine"]
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cypher execution error: {str(e)}")
+
+
+@router.post("/reconnect")
+async def reconnect_falkordb():
+    """
+    Attempts to connect or reconnect to the configured live FalkorDB instance.
+    If connected, automatically ensures the graph is idempotently seeded.
+    """
+    is_live = falkor_client.reconnect()
+    if is_live:
+        from backend.app.database.seed_data import seed_graph_database
+        seed_res = seed_graph_database(falkor_client)
+        return {
+            "status": "connected",
+            "engine_mode": falkor_client.engine_type,
+            "host": falkor_client.host,
+            "port": falkor_client.port,
+            "seeding": seed_res,
+        }
+    return {
+        "status": "fallback_in_memory",
+        "engine_mode": falkor_client.engine_type,
+        "connection_error": falkor_client.connection_error,
+    }

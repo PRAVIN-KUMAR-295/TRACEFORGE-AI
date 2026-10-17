@@ -21,6 +21,8 @@ interface DashboardViewProps {
   recentInvestigations: InvestigationResult[];
   onOpenInvestigation: (inv: InvestigationResult) => void;
   onNavigateTab: (tab: string) => void;
+  nodeCount?: number;
+  edgeCount?: number;
 }
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
@@ -29,8 +31,27 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onSelectIncident,
   recentInvestigations,
   onOpenInvestigation,
-  onNavigateTab
+  onNavigateTab,
+  nodeCount,
+  edgeCount
 }) => {
+  // Deduplicate by incident ID keeping the latest run per incident, sorted newest first
+  const displayInvestigations = React.useMemo(() => {
+    const seen = new Set<string>();
+    const unique: InvestigationResult[] = [];
+    const sorted = [...recentInvestigations].sort((a, b) => {
+      const tA = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tB = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tB - tA;
+    });
+    for (const inv of sorted) {
+      if (!seen.has(inv.incident_id)) {
+        seen.add(inv.incident_id);
+        unique.push(inv);
+      }
+    }
+    return unique;
+  }, [recentInvestigations]);
   return (
     <div className="space-y-6">
       {/* Top Banner / Hero */}
@@ -89,8 +110,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <span>GRAPH TOPOLOGY</span>
             <Database className="w-4 h-4 text-cyan-400" />
           </div>
-          <div className="mt-2 text-2xl font-bold font-mono text-white">28 <span className="text-xs text-cyan-400 font-normal">NODES</span></div>
-          <div className="text-[11px] text-slate-500 mt-1">Services, DBs, Deployments</div>
+          <div className="mt-2 text-2xl font-bold font-mono text-white">{nodeCount || 29} <span className="text-xs text-cyan-400 font-normal">NODES</span></div>
+          <div className="text-[11px] text-slate-500 mt-1">{edgeCount || 32} relationships mapped</div>
         </div>
 
         <div className="p-4 rounded-xl bg-dark-850 border border-dark-700">
@@ -107,7 +128,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <span>AVERAGE TRIAGE TIME</span>
             <Clock className="w-4 h-4 text-emerald-400" />
           </div>
-          <div className="mt-2 text-2xl font-bold font-mono text-white">&lt; 150<span className="text-xs text-emerald-400 font-normal">ms</span></div>
+          <div className="mt-2 text-2xl font-bold font-mono text-white">&lt; 50<span className="text-xs text-emerald-400 font-normal">ms</span></div>
           <div className="text-[11px] text-slate-500 mt-1">Real-time Cypher traversal</div>
         </div>
       </div>
@@ -184,13 +205,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
         {/* Right 1 col: Recent Investigations History */}
         <div className="space-y-4">
-          <h2 className="text-sm font-bold font-mono uppercase text-slate-300 flex items-center space-x-2">
-            <Clock className="w-4 h-4 text-cyan-400" />
-            <span>Investigation History</span>
-          </h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-bold font-mono uppercase text-slate-300 flex items-center space-x-2">
+              <Clock className="w-4 h-4 text-cyan-400" />
+              <span>Investigation History</span>
+            </h2>
+            {displayInvestigations.length > 0 && (
+              <span className="text-[10px] font-mono text-slate-500">
+                {displayInvestigations.length} incident{displayInvestigations.length === 1 ? '' : 's'}
+                {recentInvestigations.length > displayInvestigations.length ? ` (${recentInvestigations.length} runs)` : ''}
+              </span>
+            )}
+          </div>
 
           <div className="rounded-xl bg-dark-850 border border-dark-700 p-4 space-y-3">
-            {recentInvestigations.length === 0 ? (
+            {displayInvestigations.length === 0 ? (
               <div className="text-center py-8 text-xs text-slate-500 font-mono space-y-2">
                 <p>No investigations completed in this session.</p>
                 <p className="text-blue-400 cursor-pointer hover:underline" onClick={onRunDemo}>
@@ -198,26 +227,44 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 </p>
               </div>
             ) : (
-              recentInvestigations.map(inv => (
-                <div
-                  key={inv.investigation_id}
-                  onClick={() => onOpenInvestigation(inv)}
-                  className="p-3 rounded-lg bg-dark-800 hover:bg-dark-750 border border-dark-700/80 cursor-pointer transition-all space-y-1.5"
-                >
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-mono text-blue-400 font-bold">{inv.incident_id}</span>
-                    <span className="font-mono text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-400">
-                      {inv.status}
-                    </span>
+              displayInvestigations.map(inv => {
+                const runTime = inv.created_at
+                  ? new Date(inv.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                  : null;
+                const isMitigated = inv.status === 'MITIGATED';
+                return (
+                  <div
+                    key={inv.investigation_id}
+                    onClick={() => onOpenInvestigation(inv)}
+                    className="p-3 rounded-lg bg-dark-800 hover:bg-dark-750 border border-dark-700/80 cursor-pointer transition-all space-y-1.5"
+                  >
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center space-x-2">
+                        <span className="font-mono text-blue-400 font-bold">{inv.incident_id}</span>
+                        <span className="font-mono text-[10px] text-slate-500">#{inv.investigation_id.slice(0, 8)}</span>
+                      </div>
+                      <div className="flex items-center space-x-1.5">
+                        {runTime && <span className="font-mono text-[10px] text-slate-500">{runTime}</span>}
+                        <span
+                          className={`font-mono text-[10px] px-1.5 py-0.2 rounded ${
+                            isMitigated
+                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                              : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                          }`}
+                        >
+                          {inv.status}
+                        </span>
+                      </div>
+                    </div>
+                    <h4 className="text-xs font-semibold text-white truncate">{inv.incident_title}</h4>
+                    <p className="text-[11px] text-slate-400 line-clamp-2">{inv.primary_root_cause}</p>
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 pt-1 border-t border-dark-750">
+                      <span>{inv.execution_time_ms}ms</span>
+                      <span>{(inv.confirmed_facts || []).length} facts / {(inv.recommended_actions || []).length} actions</span>
+                    </div>
                   </div>
-                  <h4 className="text-xs font-semibold text-white truncate">{inv.incident_title}</h4>
-                  <p className="text-[11px] text-slate-400 line-clamp-2">{inv.primary_root_cause}</p>
-                  <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 pt-1 border-t border-dark-750">
-                    <span>{inv.execution_time_ms}ms</span>
-                    <span>{(inv.confirmed_facts || []).length} facts / {(inv.recommended_actions || []).length} actions</span>
-                  </div>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         </div>

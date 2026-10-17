@@ -11,9 +11,12 @@ class Settings(BaseSettings):
     # FalkorDB Graph Database Configuration
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
+    falkordb_username: Optional[str] = None
     falkordb_password: Optional[str] = None
+    falkordb_ssl: bool = False
     falkordb_graph_name: str = "traceforge_incidents"
     falkordb_timeout: int = 5
+    falkordb_read_only: bool = False
 
     # LLM Configuration (Configurable Provider Interface)
     # Providers: "demo", "openai", "anthropic", "gemini", "groq", "ollama"
@@ -24,6 +27,10 @@ class Settings(BaseSettings):
 
     # Deterministic Demo Mode
     demo_mode: bool = True
+
+    # Autonomous Tool-Calling Agent Configuration (Track 1: Connected Data Agent)
+    agent_mode: bool = False
+    max_agent_iterations: int = 5
 
     # Server Configuration
     api_host: str = "0.0.0.0"

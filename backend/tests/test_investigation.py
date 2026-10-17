@@ -87,24 +87,29 @@ def test_unexpected_row_shapes_handled_safely():
 @pytest.mark.asyncio
 async def test_findings_derived_from_query_results():
     """Verify that adding new graph nodes directly alters the derived findings."""
-    g = falkor_client.memory_engine
-    g.add_node("INC-DYNAMIC-TEST", "Incident", {
-        "id": "INC-DYNAMIC-TEST",
-        "title": "Inventory Deadlock",
-        "affected_service": "inventory-service"
-    })
-    g.add_edge("INC-DYNAMIC-TEST", "inventory-service", "AFFECTS", {})
-    g.add_edge("inventory-service", "order-service", "DEPENDS_ON", {"type": "gRPC", "critical": True, "timeout_ms": 1200})
+    orig_connected = falkor_client.is_connected
+    try:
+        falkor_client.is_connected = False
+        g = falkor_client.memory_engine
+        g.add_node("INC-DYNAMIC-TEST", "Incident", {
+            "id": "INC-DYNAMIC-TEST",
+            "title": "Inventory Deadlock",
+            "affected_service": "inventory-service"
+        })
+        g.add_edge("INC-DYNAMIC-TEST", "inventory-service", "AFFECTS", {})
+        g.add_edge("inventory-service", "order-service", "DEPENDS_ON", {"type": "gRPC", "critical": True, "timeout_ms": 1200})
 
-    result = await investigation_engine.investigate_incident("INC-DYNAMIC-TEST")
+        result = await investigation_engine.investigate_incident("INC-DYNAMIC-TEST")
 
-    # Verify dependency fact is dynamically derived
-    fact_targets = [f.target_node for f in result.confirmed_facts]
-    assert "order-service" in fact_targets
-    dep_fact = next(f for f in result.confirmed_facts if f.target_node == "order-service")
-    assert dep_fact.source_node == "inventory-service"
-    assert dep_fact.relationship_type == "DEPENDS_ON"
-    assert "1200ms" in dep_fact.description
+        # Verify dependency fact is dynamically derived
+        fact_targets = [f.target_node for f in result.confirmed_facts]
+        assert "order-service" in fact_targets
+        dep_fact = next(f for f in result.confirmed_facts if f.target_node == "order-service")
+        assert dep_fact.source_node == "inventory-service"
+        assert dep_fact.relationship_type == "DEPENDS_ON"
+        assert "1200ms" in dep_fact.description
+    finally:
+        falkor_client.is_connected = orig_connected
 
 
 def test_persistent_memory_storage_and_search():
@@ -223,49 +228,54 @@ async def test_memory_retrieval_tool_grounded_records():
     assert res.tool_record.status == "SUCCESS"
 
     # Case 2: Similar incident with NO linked Resolution node
-    g = falkor_client.memory_engine
-    g.add_node("INC-TEST-NO-RES-SRC", "Incident", {"id": "INC-TEST-NO-RES-SRC", "title": "Kafka Lag Event"})
-    g.add_node("INC-TEST-NO-RES-TARGET", "Incident", {
-        "id": "INC-TEST-NO-RES-TARGET",
-        "title": "Historical Kafka Crash (Unresolved)",
-        "root_cause_summary": "Unpartitioned stream starved disk."
-    })
-    g.add_edge("INC-TEST-NO-RES-SRC", "INC-TEST-NO-RES-TARGET", "SIMILAR_TO", {
-        "similarity": 0.88,
-        "pattern": "Kafka topic starvation"
-    })
+    orig_connected = falkor_client.is_connected
+    try:
+        falkor_client.is_connected = False
+        g = falkor_client.memory_engine
+        g.add_node("INC-TEST-NO-RES-SRC", "Incident", {"id": "INC-TEST-NO-RES-SRC", "title": "Kafka Lag Event"})
+        g.add_node("INC-TEST-NO-RES-TARGET", "Incident", {
+            "id": "INC-TEST-NO-RES-TARGET",
+            "title": "Historical Kafka Crash (Unresolved)",
+            "root_cause_summary": "Unpartitioned stream starved disk."
+        })
+        g.add_edge("INC-TEST-NO-RES-SRC", "INC-TEST-NO-RES-TARGET", "SIMILAR_TO", {
+            "similarity": 0.88,
+            "pattern": "Kafka topic starvation"
+        })
 
-    res_no_res = memory_retrieval_tool.retrieve(incident_id="INC-TEST-NO-RES-SRC", step_number=3)
-    assert len(res_no_res.matches) == 1
-    no_res_match = res_no_res.matches[0]
-    assert no_res_match.incident_id == "INC-TEST-NO-RES-TARGET"
-    assert no_res_match.resolution_strategy.startswith("UNAVAILABLE:")
-    assert no_res_match.transferrable_fix.startswith("UNAVAILABLE:")
-    assert "no recorded resolution in graph memory" in no_res_match.influence_explanation
-    assert "Apply known postmortem configuration fix" not in no_res_match.resolution_strategy
+        res_no_res = memory_retrieval_tool.retrieve(incident_id="INC-TEST-NO-RES-SRC", step_number=3)
+        assert len(res_no_res.matches) == 1
+        no_res_match = res_no_res.matches[0]
+        assert no_res_match.incident_id == "INC-TEST-NO-RES-TARGET"
+        assert no_res_match.resolution_strategy.startswith("UNAVAILABLE:")
+        assert no_res_match.transferrable_fix.startswith("UNAVAILABLE:")
+        assert "no recorded resolution in graph memory" in no_res_match.influence_explanation
+        assert "Apply known postmortem configuration fix" not in no_res_match.resolution_strategy
 
-    # Case 3: Linked Resolution node with missing/empty properties
-    g.add_node("INC-TEST-EMPTY-SRC", "Incident", {"id": "INC-TEST-EMPTY-SRC", "title": "Memory Leak Anomaly"})
-    g.add_node("INC-TEST-EMPTY-TARGET", "Incident", {
-        "id": "INC-TEST-EMPTY-TARGET",
-        "title": "Historical Memory Anomaly",
-        "root_cause_summary": "Heap fragmentation in JVM worker."
-    })
-    g.add_node("RES-EMPTY-NODE", "Resolution", {"id": "RES-EMPTY-NODE"})  # No strategy or fix properties
-    g.add_edge("INC-TEST-EMPTY-SRC", "INC-TEST-EMPTY-TARGET", "SIMILAR_TO", {
-        "similarity": 0.82,
-        "pattern": "Heap saturation"
-    })
-    g.add_edge("INC-TEST-EMPTY-TARGET", "RES-EMPTY-NODE", "RESOLVED_BY", {})
+        # Case 3: Linked Resolution node with missing/empty properties
+        g.add_node("INC-TEST-EMPTY-SRC", "Incident", {"id": "INC-TEST-EMPTY-SRC", "title": "Memory Leak Anomaly"})
+        g.add_node("INC-TEST-EMPTY-TARGET", "Incident", {
+            "id": "INC-TEST-EMPTY-TARGET",
+            "title": "Historical Memory Anomaly",
+            "root_cause_summary": "Heap fragmentation in JVM worker."
+        })
+        g.add_node("RES-EMPTY-NODE", "Resolution", {"id": "RES-EMPTY-NODE"})  # No strategy or fix properties
+        g.add_edge("INC-TEST-EMPTY-SRC", "INC-TEST-EMPTY-TARGET", "SIMILAR_TO", {
+            "similarity": 0.82,
+            "pattern": "Heap saturation"
+        })
+        g.add_edge("INC-TEST-EMPTY-TARGET", "RES-EMPTY-NODE", "RESOLVED_BY", {})
 
-    res_empty = memory_retrieval_tool.retrieve(incident_id="INC-TEST-EMPTY-SRC", step_number=3)
-    assert len(res_empty.matches) == 1
-    empty_match = res_empty.matches[0]
-    assert empty_match.incident_id == "INC-TEST-EMPTY-TARGET"
-    assert empty_match.resolution_strategy.startswith("UNVERIFIED:")
-    assert empty_match.transferrable_fix.startswith("UNVERIFIED:")
-    assert "fix parameters are unrecorded" in empty_match.influence_explanation
-    assert "Review service configuration parameters" not in empty_match.transferrable_fix
+        res_empty = memory_retrieval_tool.retrieve(incident_id="INC-TEST-EMPTY-SRC", step_number=3)
+        assert len(res_empty.matches) == 1
+        empty_match = res_empty.matches[0]
+        assert empty_match.incident_id == "INC-TEST-EMPTY-TARGET"
+        assert empty_match.resolution_strategy.startswith("UNVERIFIED:")
+        assert empty_match.transferrable_fix.startswith("UNVERIFIED:")
+        assert "fix parameters are unrecorded" in empty_match.influence_explanation
+        assert "Review service configuration parameters" not in empty_match.transferrable_fix
+    finally:
+        falkor_client.is_connected = orig_connected
 
     # Case 4: No similar incident matches in graph
     empty_res = memory_retrieval_tool.retrieve(incident_id="INC-NONEXISTENT", step_number=3)

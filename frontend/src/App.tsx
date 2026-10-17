@@ -192,6 +192,8 @@ export function App() {
               setCurrentTab('investigation');
             }}
             onNavigateTab={setCurrentTab}
+            nodeCount={nodes.length || health?.falkordb?.total_nodes || 29}
+            edgeCount={edges.length || health?.falkordb?.total_edges || 32}
           />
         )}
 
@@ -247,7 +249,7 @@ export function App() {
         <div className="max-w-7xl mx-auto px-4 flex flex-wrap items-center justify-between gap-2">
           <span>TRACEFORGE AI • Graph Hacks 2026 Submission</span>
           <span className="text-cyan-400">Powered by FalkorDB Graph Engine & Context for AI Agents</span>
-          <span>Deterministic Demo Mode Enabled</span>
+          <span>{health?.llm?.is_demo_mode !== false ? 'Deterministic Demo Mode Enabled' : 'Live Autonomous LLM Mode'}</span>
         </div>
       </footer>
     </div>

@@ -10,6 +10,7 @@ router = APIRouter(prefix="/api/investigations", tags=["Investigations"])
 class StartInvestigationRequest(BaseModel):
     incident_id: str = "INC-2026-1042"
     custom_description: Optional[str] = None
+    enable_agent_mode: Optional[bool] = None
 
 
 @router.post("/start", response_model=InvestigationResult)
@@ -18,11 +19,13 @@ async def start_investigation(req: StartInvestigationRequest):
     Initiates an AI-powered graph investigation for an incident.
     Traverses FalkorDB relationships, separates confirmed facts from hypotheses,
     recalls persistent incident memory, and proposes human-in-the-loop action plans.
+    Supports deterministic sequential execution and optional autonomous agent tool loop.
     """
     try:
         result = await investigation_engine.investigate_incident(
             incident_id=req.incident_id,
-            custom_query=req.custom_description
+            custom_query=req.custom_description,
+            enable_agent_mode=req.enable_agent_mode,
         )
         return result
     except Exception as e:
@@ -30,13 +33,16 @@ async def start_investigation(req: StartInvestigationRequest):
 
 
 @router.get("/demo", response_model=InvestigationResult)
-async def run_one_click_demo():
+async def run_one_click_demo(agent_mode: Optional[bool] = Query(default=None)):
     """
     One-click demo investigation endpoint.
     Performs an end-to-end investigation on the live enterprise cascade failure incident.
     """
     try:
-        result = await investigation_engine.investigate_incident(incident_id="INC-2026-1042")
+        result = await investigation_engine.investigate_incident(
+            incident_id="INC-2026-1042",
+            enable_agent_mode=agent_mode,
+        )
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Demo investigation failed: {str(e)}")

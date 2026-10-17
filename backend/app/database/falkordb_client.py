@@ -2,6 +2,7 @@ import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
+from backend.app.config import settings
 
 try:
     from falkordb import FalkorDB as LiveFalkorDB
@@ -332,61 +333,146 @@ class FalkorDBClient:
     live FalkorDB instance is unavailable.
     """
 
-    def __init__(self, host: str = "localhost", port: int = 6379, password: Optional[str] = None, graph_name: str = "traceforge_incidents"):
-        self.host = host
-        self.port = port
-        self.password = password
-        self.graph_name = graph_name
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        ssl: Optional[bool] = None,
+        graph_name: Optional[str] = None,
+        timeout: Optional[int] = None,
+        read_only: Optional[bool] = None,
+    ):
+        self.host = host or getattr(settings, "falkordb_host", "localhost")
+        self.port = port or getattr(settings, "falkordb_port", 6379)
+        self.username = username if username is not None else getattr(settings, "falkordb_username", None)
+        self.password = password if password is not None else getattr(settings, "falkordb_password", None)
+        self.ssl = ssl if ssl is not None else getattr(settings, "falkordb_ssl", False)
+        self.graph_name = graph_name or getattr(settings, "falkordb_graph_name", "traceforge_incidents")
+        self.timeout = timeout or getattr(settings, "falkordb_timeout", 5)
+        self.read_only: bool = (
+            read_only
+            if read_only is not None
+            else (
+                bool(getattr(settings, "falkordb_read_only", False))
+                or self.username == "traceforge_app"
+            )
+        )
+        self.is_read_only: bool = self.read_only
 
         self.live_client = None
         self.live_graph = None
         self.is_connected = False
+        self.connection_error: Optional[str] = None
         self.engine_type = "FalkorDB (In-Memory Cypher Engine)"
 
         # Initialize internal in-memory Cypher graph
-        self.memory_engine = FalkorMemoryGraphEngine(name=graph_name)
+        self.memory_engine = FalkorMemoryGraphEngine(name=self.graph_name)
         self._init_connection()
+
+    @staticmethod
+    def _strip_comments_and_strings(query: str) -> str:
+        """
+        Strips comments and string literals so keywords in comments or data
+        do not affect query classification.
+        """
+        # Remove single-line comments // ...
+        q = re.sub(r"//.*$", "", query, flags=re.MULTILINE)
+        # Remove multi-line comments /* ... */
+        q = re.sub(r"/\*.*?\*/", "", q, flags=re.DOTALL)
+        # Remove single and double quoted string literals
+        q = re.sub(r"'([^'\\]|\\.)*'", "''", q)
+        q = re.sub(r'"([^"\\]|\\.)*"', '""', q)
+        return q
+
+    @classmethod
+    def _is_read_only_query(cls, query: str) -> bool:
+        """
+        Returns True only if the Cypher query contains no mutating clauses.
+        Conservatively treats CALL and FOREACH as non-read-only.
+        """
+        cleaned = cls._strip_comments_and_strings(query)
+        conservative_keywords = {
+            "CREATE", "MERGE", "SET", "DELETE", "REMOVE", "DROP",
+            "CALL", "FOREACH"
+        }
+        tokens = set(re.findall(r"\b[A-Za-z_]+\b", cleaned.upper()))
+        return not bool(tokens & conservative_keywords)
 
     def _init_connection(self):
         if not HAS_FALKORDB_LIB:
-            logger.info("falkordb library not installed, using In-Memory Cypher Engine")
             self.is_connected = False
+            self.connection_error = "falkordb Python library is not installed in the current environment"
             self.engine_type = "FalkorDB (In-Memory Cypher Engine)"
+            logger.info("falkordb library not installed, using In-Memory Cypher Engine")
             return
 
         try:
-            client = LiveFalkorDB(host=self.host, port=self.port, password=self.password)
-            # Ping test with low timeout
-            graph = client.select_graph(self.graph_name)
-            # Try a lightweight query
-            graph.query("RETURN 1")
+            client = LiveFalkorDB(
+                host=self.host,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                ssl=self.ssl,
+            )
+            # Protocol-level ping test: verifies socket, TLS, and credentials without requiring graph existence
+            client.connection.ping()
             self.live_client = client
-            self.live_graph = graph
+            self.live_graph = client.select_graph(self.graph_name)
             self.is_connected = True
+            self.connection_error = None
             self.engine_type = "FalkorDB (Live Cluster)"
-            logger.info(f"Successfully connected to live FalkorDB at {self.host}:{self.port}")
+            logger.info(f"Successfully connected to live FalkorDB at {self.host}:{self.port} (graph: {self.graph_name})")
         except Exception as e:
-            logger.warning(f"FalkorDB live connection unavailable ({str(e)}). Active mode: FalkorDB (In-Memory Cypher Engine)")
+            self.connection_error = f"{type(e).__name__}: {str(e)}"
+            logger.warning(f"FalkorDB live connection unavailable ({self.connection_error}). Active mode: FalkorDB (In-Memory Cypher Engine)")
             self.live_client = None
             self.live_graph = None
             self.is_connected = False
             self.engine_type = "FalkorDB (In-Memory Cypher Engine)"
 
-    def execute_cypher(self, query: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def reconnect(self) -> bool:
+        """
+        Attempts to establish connection to the configured FalkorDB instance.
+        Returns True if successfully connected to live FalkorDB, False otherwise.
+        """
+        self._init_connection()
+        return self.is_connected
+
+    def execute_cypher(
+        self,
+        query: str,
+        params: Optional[Dict[str, Any]] = None,
+        read_only: Optional[bool] = None,
+    ) -> Dict[str, Any]:
         """
         Executes an OpenCypher query.
         Returns columns, result rows, execution time, and active engine.
+        Uses ro_query() for read-only queries to respect least-privilege ACLs.
+        When connected in live mode, surfaces live query failures rather than silently falling back.
         """
         start_time = time.perf_counter()
         params = params or {}
 
         if self.is_connected and self.live_graph:
             try:
-                result = self.live_graph.query(query, params)
+                is_ro = read_only if read_only is not None else self._is_read_only_query(query)
+                if is_ro and hasattr(self.live_graph, "ro_query"):
+                    result = self.live_graph.ro_query(query, params)
+                else:
+                    result = self.live_graph.query(query, params)
                 exec_time = (time.perf_counter() - start_time) * 1000.0
                 
                 # Format live result
-                columns = [h[0] if isinstance(h, (list, tuple)) else str(h) for h in (result.header or [])]
+                columns = [
+                    (h[1].decode() if isinstance(h[1], bytes) else str(h[1]))
+                    if isinstance(h, (list, tuple)) and len(h) >= 2 and isinstance(h[1], (str, bytes))
+                    else (h[0].decode() if isinstance(h[0], bytes) else str(h[0]))
+                    if isinstance(h, (list, tuple)) and len(h) >= 1
+                    else str(h)
+                    for h in (result.header or [])
+                ]
                 data = []
                 for row in result.result_set:
                     row_data = []
@@ -402,12 +488,24 @@ class FalkorDBClient:
                     "rows": data,
                     "row_count": len(data),
                     "execution_time_ms": round(exec_time, 2),
-                    "engine": "FalkorDB (Live Cluster)"
+                    "engine": "FalkorDB (Live Cluster)",
+                    "error": None,
                 }
             except Exception as e:
-                logger.error(f"Live FalkorDB query error: {str(e)}. Falling back to in-memory graph.")
+                exec_time = (time.perf_counter() - start_time) * 1000.0
+                err_msg = str(e)
+                logger.error(f"Live FalkorDB query error: {err_msg}")
+                # Surface live query failures explicitly when connected
+                return {
+                    "columns": [],
+                    "rows": [],
+                    "row_count": 0,
+                    "execution_time_ms": round(exec_time, 2),
+                    "engine": "FalkorDB (Live Cluster)",
+                    "error": err_msg,
+                }
 
-        # In-memory evaluation with identical Cypher logic
+        # In-memory evaluation with identical Cypher logic (offline fallback)
         columns, rows = self.memory_engine.query(query, params)
         exec_time = (time.perf_counter() - start_time) * 1000.0
 
@@ -416,14 +514,73 @@ class FalkorDBClient:
             "rows": rows,
             "row_count": len(rows),
             "execution_time_ms": round(exec_time, 2),
-            "engine": "FalkorDB (In-Memory Cypher Engine)"
+            "engine": "FalkorDB (In-Memory Cypher Engine)",
+            "error": None,
         }
 
     def get_topology(self) -> Dict[str, Any]:
         """
         Returns full graph topology (all nodes and edges) for the interactive explorer.
+        Queries live FalkorDB instance when connected, falling back to in-memory engine.
         """
         start_time = time.perf_counter()
+        if self.is_connected and self.live_graph:
+            try:
+                node_res = self.live_graph.ro_query("MATCH (n) RETURN n") if hasattr(self.live_graph, "ro_query") else self.live_graph.query("MATCH (n) RETURN n")
+                nodes = []
+                for row in node_res.result_set:
+                    node_obj = row[0]
+                    props = dict(getattr(node_obj, "properties", {}) or {})
+                    nid = str(props.get("id", getattr(node_obj, "id", "")))
+                    lbl = getattr(node_obj, "labels", None)
+                    if isinstance(lbl, (list, tuple)) and lbl:
+                        label_name = lbl[0]
+                    elif hasattr(node_obj, "label") and node_obj.label:
+                        label_name = str(node_obj.label)
+                    else:
+                        label_name = props.get("label", "Node")
+                    nodes.append({
+                        "id": nid,
+                        "label": label_name,
+                        "name": props.get("name", nid),
+                        "type": props.get("type", label_name),
+                        "properties": props,
+                        "status": props.get("status", "healthy"),
+                        "description": props.get("description", ""),
+                    })
+
+                edge_q = "MATCH (a)-[r]->(b) RETURN a.id, type(r), b.id, properties(r)"
+                edge_res = self.live_graph.ro_query(edge_q) if hasattr(self.live_graph, "ro_query") else self.live_graph.query(edge_q)
+                edges = []
+                edge_idx = 1
+                for row in edge_res.result_set:
+                    src_id = str(row[0])
+                    rel_type = str(row[1])
+                    tgt_id = str(row[2])
+                    props = dict(row[3]) if len(row) > 3 and isinstance(row[3], dict) else {}
+                    eid = props.get("id", f"edge_{edge_idx}")
+                    edges.append({
+                        "id": str(eid),
+                        "source": src_id,
+                        "target": tgt_id,
+                        "type": rel_type,
+                        "properties": props,
+                        "weight": float(props.get("weight", 1.0)) if "weight" in props else 1.0,
+                    })
+                    edge_idx += 1
+
+                exec_time = (time.perf_counter() - start_time) * 1000.0
+                return {
+                    "nodes": nodes,
+                    "edges": edges,
+                    "total_nodes": len(nodes),
+                    "total_edges": len(edges),
+                    "query_time_ms": round(exec_time, 2),
+                    "engine_type": self.engine_type,
+                }
+            except Exception as e:
+                logger.warning(f"Error fetching live topology from FalkorDB ({e}), falling back to memory engine")
+
         nodes = [n.to_dict() for n in self.memory_engine.nodes.values()]
         edges = [e.to_dict() for e in self.memory_engine.edges.values()]
         exec_time = (time.perf_counter() - start_time) * 1000.0
@@ -440,7 +597,62 @@ class FalkorDBClient:
     def get_node_subgraph(self, node_id: str, depth: int = 2) -> Dict[str, Any]:
         """
         Extracts neighborhood subgraph around a specific node.
+        Queries live FalkorDB instance when connected, falling back to in-memory engine.
         """
+        if self.is_connected and self.live_graph:
+            try:
+                q = (
+                    f"MATCH (root {{id: $node_id}})-[r*1..{depth}]-(other) "
+                    "RETURN root, r, other"
+                )
+                res = self.live_graph.ro_query(q, {"node_id": node_id}) if hasattr(self.live_graph, "ro_query") else self.live_graph.query(q, {"node_id": node_id})
+                seen_nodes = set()
+                nodes_list = []
+                edges_list = []
+                edge_idx = 1
+                for row in res.result_set:
+                    for item in [row[0], row[2]]:
+                        props = dict(getattr(item, "properties", {}) or {})
+                        nid = str(props.get("id", getattr(item, "id", "")))
+                        if nid and nid not in seen_nodes:
+                            seen_nodes.add(nid)
+                            lbl = getattr(item, "labels", None)
+                            label_name = lbl[0] if isinstance(lbl, (list, tuple)) and lbl else getattr(item, "label", props.get("label", "Node"))
+                            nodes_list.append({
+                                "id": nid,
+                                "label": label_name,
+                                "name": props.get("name", nid),
+                                "type": props.get("type", label_name),
+                                "properties": props,
+                                "status": props.get("status", "healthy"),
+                                "description": props.get("description", ""),
+                            })
+                    rel_items = row[1] if isinstance(row[1], (list, tuple)) else [row[1]]
+                    for rel in rel_items:
+                        r_props = dict(getattr(rel, "properties", {}) or {})
+                        r_type = getattr(rel, "relation", getattr(rel, "type", "RELATED_TO"))
+                        src = str(r_props.get("source", getattr(rel, "src_node", "")))
+                        tgt = str(r_props.get("target", getattr(rel, "dest_node", "")))
+                        eid = r_props.get("id", f"sub_edge_{edge_idx}")
+                        edges_list.append({
+                            "id": str(eid),
+                            "source": src,
+                            "target": tgt,
+                            "type": str(r_type),
+                            "properties": r_props,
+                            "weight": float(r_props.get("weight", 1.0)) if "weight" in r_props else 1.0,
+                        })
+                        edge_idx += 1
+                if nodes_list:
+                    return {
+                        "root_node_id": node_id,
+                        "nodes": nodes_list,
+                        "edges": edges_list,
+                        "depth": depth,
+                    }
+            except Exception as e:
+                logger.warning(f"Error fetching live subgraph from FalkorDB ({e}), falling back to memory engine")
+
         nodes, edges = self.memory_engine.get_neighbors(node_id, depth)
         return {
             "root_node_id": node_id,
